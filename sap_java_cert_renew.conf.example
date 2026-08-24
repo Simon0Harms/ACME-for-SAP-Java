@@ -1,0 +1,79 @@
+# =============================================================================
+# sap_java_cert_renew.conf  -  example configuration
+#
+# Copy this file to  sap_java_cert_renew.conf  (next to the script) and adjust
+# the values. The live .conf is git-ignored because it holds internal host
+# names, mail addresses and paths. Every setting is a plain shell assignment
+# and simply overrides the built-in default in the script.
+#
+# You can also override any variable per run on the command line, e.g.:
+#   DRYRUN=1 ./sap_java_cert_renew.sh          # preview only
+#   FORCE=1  ./sap_java_cert_renew.sh          # ignore the idempotency state
+# =============================================================================
+
+# --- system identity ---------------------------------------------------------
+# SID is auto-detected on single-system hosts (and on hosts where only one
+# system owns the INSTANCE_NAME instance directory). Set it explicitly only if
+# detection cannot decide - e.g. several SAP systems with a J00 instance.
+# SID="H01"
+INST="00"                 # instance number (two digits)
+INSTANCE_NAME="J00"       # instance directory name (e.g. J00)
+
+# --- acme.sh -----------------------------------------------------------------
+ACME_HOME="/root/.acme.sh"
+
+# The FQDN is normally read from the instance profile (SAPLOCALHOSTFULL). Set it
+# explicitly only if that fails:
+# HOST_FQDN="sapjava.example.com"
+
+# --- root CA for the server chain -------------------------------------------
+# Primary source is root_ca.cer next to the leaf. Otherwise point to it, or let
+# the script scan the system trust store for a subject substring.
+# ROOT_CA_FILE="/etc/ssl/certs/My_Root_CA.pem"
+# ROOT_CA_SUBJECT_MATCH="My Organisation Root CA"
+
+# --- targets -----------------------------------------------------------------
+DO_SERVER="1"             # ICM HTTPS server certificate (via CRED PSE) - default on
+DO_CLIENT="0"             # client Key Storage view (telnet LOAD) - default off
+DO_SERVICE_SSL="0"        # legacy service_ssl view - only if actually used
+SYNC_SERVER_VIEW="0"      # also push the server cert into ICM_SSL_<id>_<port>
+
+# --- behaviour ---------------------------------------------------------------
+# DRYRUN="1"              # preview without changing anything
+# ALLOW_ALGO_CHANGE="1"   # allow an RSA<->ECC switch on the live endpoint
+# RESTART_ICM_FALLBACK="1"  # restart the instance instead of SIGHUP for the reload
+
+# --- Key Storage view / entry names (site specific) --------------------------
+# Discover them with LISTVIEWSNAMES in the telnet console, or read them in NWA.
+# ICM_SSL views contain the instance id (find it via j2ee/instance_id, e.g. 39631).
+# SERVER_VIEW="ICM_SSL_39631_50001"    # only needed if SYNC_SERVER_VIEW=1
+# SERVER_ALIAS="ssl-credentials"
+# CLIENT_VIEW="CLIENT_ICM_SSL_39631"   # needed if DO_CLIENT=1
+# CLIENT_ALIAS="myhost-client"         # EXACT existing entry name (an alias, not the CN)
+# SERVICE_SSL_VIEW="service_ssl"
+# SERVICE_SSL_ALIAS="ssl-credentials"
+
+# --- telnet administration console ------------------------------------------
+JAVA_TELNET_USER="Administrator"
+JAVA_TELNET_PW_FILE="/root/sap_certs/${SID}_telnet.pw"   # chmod 600
+# KEYSTORE_GROUP="keystore"          # verify with bare 'man' in the console
+# TELNET_WAIT="2"                    # raise if LOADs fail intermittently
+# TELNET_STEP_WAIT="2"
+
+# --- external client p12 (only used when DO_CLIENT=1) ------------------------
+# A clientAuth certificate from your internal CA (NOT the acme/HARICA server
+# cert). Must contain the full chain, or set CLIENT_CHAIN to a PEM with the
+# intermediate/root certificates.
+# CLIENT_P12="/root/sap_certs/client.p12"
+# CLIENT_P12PW_FILE="/root/sap_certs/client.p12.pw"   # chmod 600
+# CLIENT_CHAIN="/root/sap_certs/client_chain.pem"
+
+# --- monitoring / mail (both optional) --------------------------------------
+# MAILTO="sap-alerts@example.com"
+# CMK_SPOOL="/var/lib/check_mk_agent/spool"
+# WARN_DAYS="14"
+# CRIT_DAYS="7"
+
+# --- tool paths (e.g. AIX with GNU tools under /opt/freeware) ----------------
+# OPENSSL="/opt/freeware/bin/openssl"
+# PERL="/opt/freeware/bin/perl"

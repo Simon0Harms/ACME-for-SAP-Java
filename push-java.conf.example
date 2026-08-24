@@ -1,0 +1,34 @@
+# push-java.conf - configuration for sap_cert_push.sh when the target is a
+# SAP AS Java host running sap_java_cert_renew.sh.
+#
+# sap_cert_push.sh is the optional central-host add-on from
+#   https://github.com/Simon0Harms/ACME-for-SAP-ABAP
+# It runs on the machine where acme.sh lives, copies the renewed certificate to
+# the SAP host over SSH, and then runs REMOTE_SCRIPT there. This file is sourced
+# as shell code; keep it root-owned and mode 0600.
+#
+# Wire it into acme.sh as the reload command:
+#   --reloadcmd "CONFIG_FILE=/srv/SSL/push-java.conf /srv/SSL/sap_cert_push.sh"
+
+# Take the target host from the certificate directory name (hook mode).
+TARGETS="auto"
+
+# The Java deployment script on the SAP host (absolute path).
+REMOTE_SCRIPT="/sap_migrate/skripte/Java/sap_java_cert_renew.sh"
+
+# SSH login on the target (key-based).
+SSH_USER="root"
+
+# --- optional ---------------------------------------------------------------
+# The Java target normally reads its own sap_java_cert_renew.conf (next to the
+# script or /etc/sap_java_cert_renew.conf). You can also pass settings from here
+# via REMOTE_ENV, which is prepended as 'env ... sh REMOTE_SCRIPT':
+#REMOTE_ENV="ALLOW_ALGO_CHANGE=1"
+#REMOTE_ENV="CONFIG_FILE=/etc/sap_java_cert_renew.conf"
+#REMOTE_ENV="DO_CLIENT=0 MAILTO=sap-alerts@example.com"
+
+# Where the leaf is copied to on the target (must match ACME_HOME there).
+#REMOTE_ACME_HOME="/root/.acme.sh"
+
+# Transfer only, do not deploy (useful for a first test).
+#REMOTE_RUN=0
