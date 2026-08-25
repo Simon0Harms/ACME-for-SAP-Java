@@ -354,6 +354,7 @@ cleanup() {
 
   if [ "$FAILED" -ne 0 ] || [ "$_cu_rc" -ne 0 ]; then
     _cu_msg="$FAIL_MSG"; [ -n "$_cu_msg" ] || _cu_msg="aborted in step: ${STEP:-unknown} (rc=$_cu_rc)"
+    echo "ERROR: $_cu_msg" >&2
     report_checkmk 2 "-" "AS Java certificate renewal FAILED: $_cu_msg"
     send_mail "CRIT: AS Java certificate $SID" "The renewal failed.
 
