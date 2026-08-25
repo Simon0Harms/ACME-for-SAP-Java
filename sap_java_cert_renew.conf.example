@@ -36,7 +36,8 @@ ACME_HOME="/root/.acme.sh"
 DO_SERVER="1"             # ICM HTTPS server certificate (via CRED PSE) - default on
 DO_CLIENT="0"             # client Key Storage view (telnet LOAD) - default off
 DO_SERVICE_SSL="0"        # legacy service_ssl view - only if actually used
-SYNC_SERVER_VIEW="0"      # also push the server cert into ICM_SSL_<id>_<port>
+SYNC_SERVER_VIEW="1"      # also push the server cert into the NWA view (default on;
+                          # keeps NWA in sync, needs the telnet console configured)
 
 # --- behaviour ---------------------------------------------------------------
 # DRYRUN="1"              # preview without changing anything
@@ -44,14 +45,19 @@ SYNC_SERVER_VIEW="0"      # also push the server cert into ICM_SSL_<id>_<port>
 # RESTART_ICM_FALLBACK="1"  # restart the instance instead of SIGHUP for the reload
 
 # --- Key Storage view / entry names (site specific) --------------------------
-# Discover them with LISTVIEWSNAMES in the telnet console, or read them in NWA.
-# ICM_SSL views contain the instance id (find it via j2ee/instance_id, e.g. 39631).
-# SERVER_VIEW="ICM_SSL_39631_50001"    # only needed if SYNC_SERVER_VIEW=1
+# SERVER_VIEW is auto-detected when left empty: ICM_SSL_<instance_id>_<port>,
+# validated against LISTVIEWSNAMES (falls back to ICM_SSL_<instance_id>). Set it
+# explicitly only to override. Discover names with LISTVIEWSNAMES / in NWA.
+# SERVER_VIEW="ICM_SSL_39631_50001"
 # SERVER_ALIAS="ssl-credentials"
 # CLIENT_VIEW="CLIENT_ICM_SSL_39631"   # needed if DO_CLIENT=1
 # CLIENT_ALIAS="myhost-client"         # EXACT existing entry name (an alias, not the CN)
 # SERVICE_SSL_VIEW="service_ssl"
 # SERVICE_SSL_ALIAS="ssl-credentials"
+
+# If LOAD does not overwrite an existing alias on your console, set the delete
+# command (run as "<cmd> <view> <alias>" before LOAD). Verify with bare 'man'.
+# KEYSTORE_DELETE_CMD="DELETE"
 
 # --- telnet administration console ------------------------------------------
 JAVA_TELNET_USER="Administrator"

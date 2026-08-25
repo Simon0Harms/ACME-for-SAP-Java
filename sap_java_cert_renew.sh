@@ -202,22 +202,29 @@ KEYSTORE_GROUP="${KEYSTORE_GROUP:-keystore}"   # telnet command group name
 TELNET_WAIT="${TELNET_WAIT:-2}"                # after connect / login
 TELNET_STEP_WAIT="${TELNET_STEP_WAIT:-2}"      # between commands
 
-# Key Storage view / entry names. These are site specific: the ICM_SSL views
-# contain the instance id (e.g. ICM_SSL_39631_50001). Discover them with
-# LISTVIEWSNAMES in the telnet console, or read them in NWA. Leave empty unless
-# the corresponding target is enabled.
-SERVER_VIEW="${SERVER_VIEW:-}"                  # e.g. ICM_SSL_<instid>_<port>
+# Key Storage view / entry names. The ICM_SSL views contain the instance id
+# (e.g. ICM_SSL_39631_50001). SERVER_VIEW is auto-detected when left empty (from
+# j2ee/instance_id + the HTTPS port, validated against LISTVIEWSNAMES). The
+# client view is site specific; set it if DO_CLIENT=1.
+SERVER_VIEW="${SERVER_VIEW:-}"                  # empty -> auto-detect ICM_SSL_<instid>_<port>
 SERVER_ALIAS="${SERVER_ALIAS:-ssl-credentials}" # standard entry name for ICM_SSL views
 CLIENT_VIEW="${CLIENT_VIEW:-}"                   # e.g. CLIENT_ICM_SSL_<instid>
 CLIENT_ALIAS="${CLIENT_ALIAS:-}"                # EXACT existing entry name (from NWA)
 SERVICE_SSL_VIEW="${SERVICE_SSL_VIEW:-service_ssl}"
 SERVICE_SSL_ALIAS="${SERVICE_SSL_ALIAS:-ssl-credentials}"
 
+# Optional: if LOAD does not overwrite an existing alias on your console, set the
+# console's delete command here; it is then run as "<cmd> <view> <alias>" before
+# LOAD. Empty = LOAD only (relies on overwrite). Verify the exact command/syntax
+# with bare 'man' in the telnet console before enabling.
+KEYSTORE_DELETE_CMD="${KEYSTORE_DELETE_CMD:-}"
+
 # Which targets to process? (1 = yes, 0 = no)
 DO_SERVER="${DO_SERVER:-1}"                 # ICM HTTPS server cert (CRED PSE)
 DO_CLIENT="${DO_CLIENT:-0}"                 # client Key Storage view (telnet LOAD)
 DO_SERVICE_SSL="${DO_SERVICE_SSL:-0}"       # legacy service_ssl (only if actually used)
-SYNC_SERVER_VIEW="${SYNC_SERVER_VIEW:-0}"   # also push the server cert into the view
+SYNC_SERVER_VIEW="${SYNC_SERVER_VIEW:-1}"   # also push the server cert into the NWA view
+                                            # (keeps NWA in sync; needs telnet configured)
 
 # Behaviour
 DRYRUN="${DRYRUN:-${DRY_RUN:-0}}"          # 1 = only print what would happen (DRY_RUN alias accepted)
@@ -480,6 +487,51 @@ stage_p12() {  # $1=source.p12 $2=target-name -> full path on stdout
   printf '%s' "$_sp_dst"
 }
 
+# ---- read j2ee/instance_id from the instance profile -----------------------
+_instid_from_profile() {  # -> digits of j2ee/instance_id (e.g. 39631)
+  _ip_dir="$USR_SAP/${SID}/SYS/profile"
+  _ip_pre="${SID}_${INSTANCE_NAME}_"
+  for _p in "$_ip_dir/$_ip_pre"*; do
+    [ -f "$_p" ] || continue
+    awk -F= '/^[ \t]*j2ee\/instance_id[ \t]*=/ {
+               gsub(/[^0-9]/,"",$2); if ($2!="") { print $2; exit } }' "$_p"
+    return 0
+  done
+}
+
+# ---- list Key Storage view names via the telnet console (LISTVIEWSNAMES) ----
+keystore_views() {  # -> one view name per line (best effort)
+  [ "$DRYRUN" = "1" ] && return 0
+  have telnet || return 0
+  [ -n "$JAVA_TELNET_PW" ] || return 0
+  _kv_cmd="$PRIV_TMP/tn_listviews.cmd"; _kv_out="$PRIV_TMP/tn_listviews.out"
+  printf 'LISTVIEWSNAMES\n' > "$_kv_cmd"
+  java_telnet "$_kv_cmd" "$_kv_out" || { secure_rm "$_kv_cmd" "$_kv_out"; return 0; }
+  # keep only bare token lines (view names are [A-Za-z0-9_]); drops banner/prompts
+  sed 's/^[[:space:]]*//;s/[[:space:]]*$//' "$_kv_out" 2>/dev/null | grep -E '^[A-Za-z0-9_]+$'
+  secure_rm "$_kv_cmd" "$_kv_out"
+}
+
+# ---- resolve the server view: ICM_SSL_<instid>_<port>, else ICM_SSL_<instid> -
+resolve_server_view() {  # -> view name (best effort) or empty
+  _rsv_id=$(_instid_from_profile 2>/dev/null)
+  [ -n "$_rsv_id" ] || return 0
+  _rsv_primary="ICM_SSL_${_rsv_id}_${HTTPS_PORT}"
+  _rsv_fallback="ICM_SSL_${_rsv_id}"
+  # no live validation possible -> return the best-guess primary
+  if [ "$DRYRUN" = "1" ] || ! have telnet || [ -z "$JAVA_TELNET_PW" ]; then
+    printf '%s' "$_rsv_primary"; return 0
+  fi
+  _rsv_views=$(keystore_views)
+  if printf '%s\n' "$_rsv_views" | grep -Fxq "$_rsv_primary"; then
+    printf '%s' "$_rsv_primary"
+  elif printf '%s\n' "$_rsv_views" | grep -Fxq "$_rsv_fallback"; then
+    printf '%s' "$_rsv_fallback"
+  else
+    printf '%s' "$_rsv_primary"
+  fi
+}
+
 # ---- renew one Key Storage view via telnet ---------------------------------
 # BACKUP the whole keystore -> LOAD -> LIST (verification).
 load_view() {  # $1=view $2=alias $3=source.p12 $4=password(optional) -> rc
@@ -497,6 +549,7 @@ load_view() {  # $1=view $2=alias $3=source.p12 $4=password(optional) -> rc
     printf '  [DRYRUN] telnet %s %s -- login as %s, add %s, then:\n' \
       "$TELNET_HOST" "$TELNET_PORT" "$JAVA_TELNET_USER" "$KEYSTORE_GROUP"
     printf '    | BACKUP %s\n' "$_lv_bak"
+    [ -n "$KEYSTORE_DELETE_CMD" ] && printf '    | %s %s %s\n' "$KEYSTORE_DELETE_CMD" "$_lv_view" "$_lv_alias"
     printf '    | LOAD %s %s -PKCS12 %s ********\n' "$_lv_view" "$_lv_alias" "$STAGE_DIR/$_lv_stage_name"
     printf '    | LIST %s\n' "$_lv_view"
     return 0
@@ -509,6 +562,7 @@ load_view() {  # $1=view $2=alias $3=source.p12 $4=password(optional) -> rc
   _lv_outf="$PRIV_TMP/tn_${_lv_view}.out"
   {
     printf 'BACKUP %s\n' "$_lv_bak"
+    [ -n "$KEYSTORE_DELETE_CMD" ] && printf '%s %s %s\n' "$KEYSTORE_DELETE_CMD" "$_lv_view" "$_lv_alias"
     printf 'LOAD %s %s -PKCS12 %s %s\n' "$_lv_view" "$_lv_alias" "$_lv_stage" "$_lv_pw"
     printf 'LIST %s\n' "$_lv_view"
   } > "$_lv_cmdf"
@@ -665,9 +719,22 @@ if [ "$DO_SERVER" = "1" ] && [ "$SERVER_CHANGED" = "1" ]; then
     echo "WARN: server cert (ICM) not fully renewed"
   fi
   if [ "$SYNC_SERVER_VIEW" = "1" ]; then
-    STEP="sync server view (telnet LOAD)"
-    load_view "$SERVER_VIEW" "$SERVER_ALIAS" "$TMP_P12" "$P12PW" \
-      || echo "WARN: server view '$SERVER_VIEW' not synced"
+    if [ "$DRYRUN" != "1" ] && { ! have telnet || [ -z "$JAVA_TELNET_PW" ]; }; then
+      log "SYNC_SERVER_VIEW=1 but telnet/password not configured - NWA view sync skipped."
+      log "      (The server certificate is still deployed via the CRED PSE.)"
+    else
+      STEP="sync server view (telnet LOAD)"
+      if [ -z "$SERVER_VIEW" ]; then
+        SERVER_VIEW=$(resolve_server_view)
+        [ -n "$SERVER_VIEW" ] && log "Auto-detected server view: $SERVER_VIEW"
+      fi
+      if [ -z "$SERVER_VIEW" ]; then
+        log "SYNC_SERVER_VIEW=1 but the server view could not be resolved - set SERVER_VIEW; sync skipped."
+      else
+        load_view "$SERVER_VIEW" "$SERVER_ALIAS" "$TMP_P12" "$P12PW" \
+          || echo "WARN: server view '$SERVER_VIEW' not synced"
+      fi
+    fi
   fi
 elif [ "$DO_SERVER" = "1" ]; then
   log "Server: unchanged since the last run - skipped."

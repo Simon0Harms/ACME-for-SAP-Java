@@ -99,7 +99,7 @@ Or from cron / by hand. When nothing has changed the script exits quietly.
 
 | Target | Mechanism | Notes |
 |---|---|---|
-| **Server** (inbound HTTPS) | `sapgenpse` → `SAPSSLS.pse` → `SIGHUP` icman | Fully scriptable. The NWA view may show the old cert (*drift*); set `SYNC_SERVER_VIEW=1` to also push it into the view. |
+| **Server** (inbound HTTPS) | `sapgenpse` → `SAPSSLS.pse` → `SIGHUP` icman | Fully scriptable. By default (`SYNC_SERVER_VIEW=1`) the cert is also pushed into the NWA view so it doesn't drift; the view name is auto-detected (`ICM_SSL_<instance_id>_<port>`). Needs the telnet console configured; skipped gracefully otherwise. |
 | **Client** identity | telnet `KEYSTORE LOAD` into a DB view | Needs a real **clientAuth** p12 (`CLIENT_P12`). A serverAuth-only ACME cert cannot be a client identity. Off by default. |
 | **service_ssl** | telnet `KEYSTORE LOAD` | Legacy view; enable only if your system still uses it. |
 
@@ -111,8 +111,10 @@ renew there unless P4S is configured.
 The telnet `KEYSTORE` behaviour is not fully documented by SAP. **Test the view
 targets on a non-production system first** and confirm:
 
-- Whether `LOAD` overwrites an existing alias or needs a prior `DELETE` (the
-  script takes a `BACKUP` before and runs `LIST` after so you can check).
+- Whether `LOAD` overwrites an existing alias or needs a prior delete (the
+  script takes a `BACKUP` before and runs `LIST` after so you can check). If your
+  console needs an explicit delete, set `KEYSTORE_DELETE_CMD` to its delete
+  command (run as `<cmd> <view> <alias>` before `LOAD`).
 - Whether `LOAD` accepts the absolute staged path under `/usr/sap/<SID>/`.
 - Whether the ICM reloads the `CRED` PSE on `SIGHUP` on your instance
   (otherwise use `RESTART_ICM_FALLBACK=1`).
