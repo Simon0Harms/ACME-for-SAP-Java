@@ -12,12 +12,14 @@
 # =============================================================================
 
 # --- system identity ---------------------------------------------------------
-# SID is auto-detected on single-system hosts (and on hosts where only one
-# system owns the INSTANCE_NAME instance directory). Set it explicitly only if
-# detection cannot decide - e.g. several SAP systems with a J00 instance.
-# SID="H01"
-INST="00"                 # instance number (two digits)
-INSTANCE_NAME="J00"       # instance directory name (e.g. J00)
+# SID and INSTANCE_NAME are auto-detected from the Java instances under /usr/sap
+# (a directory with a j2ee/ subdir, or a J*/JC* name; ABAP instances and
+# Diagnostics Agents are ignored). Set them explicitly only when several Java
+# systems exist on the host (e.g. a Solution Manager landscape) - the error then
+# lists the candidates to choose from.
+# SID="SMJ"
+# INST="00"                 # instance number (two digits)
+# INSTANCE_NAME="JC00"      # instance directory name (e.g. J00, JC00)
 
 # --- acme.sh -----------------------------------------------------------------
 ACME_HOME="/root/.acme.sh"

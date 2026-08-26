@@ -126,32 +126,55 @@ fi
 
 # ============================ Configuration ==================================
 USR_SAP="${USR_SAP:-/usr/sap}"             # SAP base directory (rarely changed)
+case "${INST:-}" in "") _INST_SET=0 ;; *) _INST_SET=1 ;; esac
 INST="${INST:-00}"                         # instance number (two digits)
 INSTANCE_NAME="${INSTANCE_NAME:-J00}"      # instance directory name, e.g. J00
 
-# SID: use the configured/env value; otherwise auto-detect. Detection prefers
-# the unique system that owns this INSTANCE_NAME directory, then falls back to
-# the only system that has a profile directory. On a host with more than one SAP
-# system (e.g. a Diagnostics Agent alongside), set SID explicitly.
-_detect_sid() {
-  set --
+# SID + instance: use configured/env values; otherwise auto-detect. Detection
+# enumerates *Java* instances under $USR_SAP - a directory with a j2ee/ subdir,
+# or a J<nr>/JC<nr> name - and ignores ABAP instances (DVEBMGS/D/ASCS/SCS/ERS
+# without j2ee) and Diagnostics Agents (DAA / SMDA*). If exactly one Java
+# instance owns INSTANCE_NAME it is used; else if there is exactly one Java
+# instance overall, its SID and instance are used. On hosts with several Java
+# systems (e.g. a Solution Manager landscape) set SID/INSTANCE_NAME explicitly.
+_java_instances() {  # prints "SID INST" per Java instance
   for _d in "$USR_SAP"/*/; do
     _s=$(basename "$_d")
     case "$_s" in [A-Z][A-Z0-9][A-Z0-9]) ;; *) continue ;; esac
-    [ -d "$USR_SAP/$_s/$INSTANCE_NAME" ] && set -- "$@" "$_s"
+    case "$_s" in DAA) continue ;; esac
+    for _i in "$USR_SAP/$_s"/*/; do
+      [ -d "$_i" ] || continue
+      _in=$(basename "$_i")
+      case "$_in" in SMDA*) continue ;; esac
+      if [ -d "$USR_SAP/$_s/$_in/j2ee" ]; then
+        printf '%s %s\n' "$_s" "$_in"
+      else
+        case "$_in" in J[0-9][0-9]|JC[0-9][0-9]) printf '%s %s\n' "$_s" "$_in" ;; esac
+      fi
+    done
   done
-  if [ "$#" -eq 1 ]; then printf '%s' "$1"; return 0; fi
-  set --
-  for _d in "$USR_SAP"/*/; do
-    _s=$(basename "$_d")
-    case "$_s" in [A-Z][A-Z0-9][A-Z0-9]) ;; *) continue ;; esac
-    [ -d "$USR_SAP/$_s/SYS/profile" ] && set -- "$@" "$_s"
-  done
-  [ "$#" -eq 1 ] && { printf '%s' "$1"; return 0; }
-  return 1
 }
+_inst_num() { printf '%s' "$1" | sed -n 's/.*\([0-9][0-9]\)$/\1/p'; }  # trailing 2 digits
+
 SID="${SID:-}"
-[ -n "$SID" ] || SID=$(_detect_sid 2>/dev/null) || SID=""
+JAVA_PAIRS=$(_java_instances 2>/dev/null)
+if [ -z "$SID" ]; then
+  _ji_match=$(printf '%s\n' "$JAVA_PAIRS" | awk -v i="$INSTANCE_NAME" 'NF && $2==i')
+  if [ "$(printf '%s\n' "$_ji_match" | grep -c '[^[:space:]]')" = "1" ]; then
+    SID=$(printf '%s\n' "$_ji_match" | awk 'NF{print $1; exit}')
+  elif [ "$(printf '%s\n' "$JAVA_PAIRS" | grep -c '[^[:space:]]')" = "1" ]; then
+    SID=$(printf '%s\n' "$JAVA_PAIRS" | awk 'NF{print $1; exit}')
+    INSTANCE_NAME=$(printf '%s\n' "$JAVA_PAIRS" | awk 'NF{print $2; exit}')
+  fi
+elif [ ! -d "$USR_SAP/$SID/$INSTANCE_NAME" ]; then
+  # SID given but the default instance dir is absent -> take the Java instance of that SID
+  _ji_cand=$(printf '%s\n' "$JAVA_PAIRS" | awk -v s="$SID" 'NF && $1==s{print $2; exit}')
+  [ -n "$_ji_cand" ] && INSTANCE_NAME="$_ji_cand"
+fi
+# derive the instance number from the (possibly detected) instance name unless set
+if [ "$_INST_SET" = "0" ]; then
+  _n=$(_inst_num "$INSTANCE_NAME"); [ -n "$_n" ] && INST="$_n"
+fi
 
 # Resolve the FQDN authoritatively from the SAP instance profile
 # (SAPLOCALHOSTFULL / icm/host_name_full). The OS host name deliberately stays
@@ -258,9 +281,14 @@ STATE_FILE="${STATE_FILE:-/var/lib/sap_cert_renew/java_${SID}.fp}"
 
 # --- SID resolution check ----------------------------------------------------
 if [ -z "$SID" ]; then
-  echo "ERROR: could not determine the SAP SID automatically" >&2
-  echo "       (none or several systems found under $USR_SAP)." >&2
-  echo "       Set SID in sap_java_cert_renew.conf (next to the script) or via SID=..." >&2
+  echo "ERROR: could not determine the SAP SID automatically." >&2
+  if printf '%s\n' "$JAVA_PAIRS" | grep -q '[^[:space:]]'; then
+    echo "       Several Java instances found - set SID (and INSTANCE_NAME) to one of:" >&2
+    printf '%s\n' "$JAVA_PAIRS" | awk 'NF{print "         SID="$1"  INSTANCE_NAME="$2}' >&2
+  else
+    echo "       No Java instance found under $USR_SAP." >&2
+  fi
+  echo "       Configure it in sap_java_cert_renew.conf (or /etc/sap_java_cert_renew.conf)." >&2
   exit 2
 fi
 
