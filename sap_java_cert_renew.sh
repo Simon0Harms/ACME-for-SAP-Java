@@ -277,6 +277,7 @@ SIDADM="$(printf '%s' "$SID" | tr '[:upper:]' '[:lower:]')adm"
 
 FAILED=0; FAIL_MSG=""; STEP="init"
 PRIV_TMP=""; TMP_P12=""
+INSTANCE_UP="${INSTANCE_UP:-}"; DEFERRED=0
 JAVA_TELNET_PW=""
 
 have() { command -v "$1" >/dev/null 2>&1; }
@@ -364,6 +365,10 @@ $_cu_msg"
   _cu_days=$(days_left "${LEAF:-}")
   _cu_exp=$("$OPENSSL" x509 -in "${LEAF:-}" -noout -enddate 2>/dev/null | sed 's/^notAfter=//')
   _cu_state=0
+  if [ "$DEFERRED" = "1" ]; then
+    report_checkmk 1 "-" "AS Java certificate staged in the PSE; instance was down - ICM reload/view sync deferred to the next run while up"
+    return
+  fi
   if [ -n "$_cu_days" ]; then
     [ "$_cu_days" -le "$WARN_DAYS" ] && _cu_state=1
     [ "$_cu_days" -le "$CRIT_DAYS" ] && _cu_state=2
@@ -434,11 +439,31 @@ served_key_algo() {  # -> RSA|EC|?  (empty if the port is unreachable)
   secure_rm "$_sk_tmp"
 }
 
+# ---- algorithm of the current CRED PSE's own cert (offline, when down) ------
+pse_key_algo() {  # -> RSA|EC|?  (empty if unreadable)
+  [ -f "$ICM_CRED_PSE" ] || { printf ''; return 0; }
+  _pk_tmp="$PRIV_TMP/cur_pse.crt"
+  if "$EXE/sapgenpse" export_own_cert -p "$ICM_CRED_PSE" -x "" -o "$_pk_tmp" >/dev/null 2>&1 \
+     && [ -s "$_pk_tmp" ]; then
+    key_algo_of_cert "$_pk_tmp"
+  else
+    printf ''
+  fi
+  secure_rm "$_pk_tmp"
+}
+
 # ---- algorithm-change guard ------------------------------------------------
+# Prefers the live endpoint; if that is unreachable (instance down) it falls
+# back to the current CRED PSE so the guard still works offline.
 algo_guard() {  # $1 = new leaf
   _ag_new=$(key_algo_of_cert "$1")
-  _ag_cur=$(served_key_algo)
-  log "Algorithm: currently served='${_ag_cur:-unknown}', new='$_ag_new'"
+  _ag_cur=$(served_key_algo); _ag_src="served"
+  if [ -z "$_ag_cur" ]; then _ag_cur=$(pse_key_algo); _ag_src="current PSE"; fi
+  if [ -n "$_ag_cur" ]; then
+    log "Algorithm: current='$_ag_cur' (from $_ag_src), new='$_ag_new'"
+  else
+    log "Algorithm: current=unknown (endpoint down and PSE unreadable) - guard inactive, new='$_ag_new'"
+  fi
   if [ -n "$_ag_cur" ] && [ "$_ag_cur" != "?" ] && [ "$_ag_new" != "?" ] \
      && [ "$_ag_cur" != "$_ag_new" ]; then
     if [ "$ALLOW_ALGO_CHANGE" = "1" ]; then
@@ -607,8 +632,24 @@ renew_icm_server() {  # $1 = p12 (with chain + root)
   return 0
 }
 
+# ---- is this instance running? ---------------------------------------------
+# Proxy: an icman / jstart / jlaunch process referencing this instance's profile
+# or directory. Override by presetting INSTANCE_UP=1|0 in the environment.
+instance_running() {
+  _ir_prof="${SID}_${INSTANCE_NAME}_"
+  ps -eo args 2>/dev/null | grep -v grep \
+    | grep -E "(icman|jstart|jlaunch)" | grep -q "$_ir_prof" && return 0
+  ps -eo args 2>/dev/null | grep -v grep | grep -q "$USR_SAP/$SID/$INSTANCE_NAME/" && return 0
+  return 1
+}
+
 # ---- reload the ICM (SIGHUP to the instance's icman; fallback: restart) -----
 reload_icm() {
+  if [ "$INSTANCE_UP" = "0" ]; then
+    log "Instance is down - ICM reload skipped; the new certificate is staged in the"
+    log "PSE and will be served automatically the next time the instance starts."
+    return 0
+  fi
   if [ "$RESTART_ICM_FALLBACK" = "1" ]; then
     log "ICM reload: fallback -> sapcontrol RestartInstance (downtime!)"
     run sapcontrol -nr "$INST" -function RestartInstance
@@ -637,6 +678,21 @@ log "=== AS Java certificate renewal: SID=$SID instance=$INSTANCE_NAME host=$HOS
 # reports an empty password itself)
 if [ -f "$JAVA_TELNET_PW_FILE" ]; then
   JAVA_TELNET_PW=$(cat "$JAVA_TELNET_PW_FILE" 2>/dev/null) || JAVA_TELNET_PW=""
+fi
+
+# Determine whether the instance is running. When it is down we still stage the
+# server certificate into the CRED PSE (served on next start) but skip the ICM
+# reload and all Key Storage view / telnet operations (which need a running
+# instance). Override with INSTANCE_UP=1|0 in the environment.
+if [ -z "${INSTANCE_UP:-}" ]; then
+  if instance_running; then INSTANCE_UP=1; else INSTANCE_UP=0; fi
+fi
+if [ "$INSTANCE_UP" = "0" ]; then
+  DEFERRED=1
+  log "Instance ${SID}/${INSTANCE_NAME} appears to be DOWN - staging the PSE only;"
+  log "ICM reload and Key Storage view operations are deferred to the next run while up."
+else
+  DEFERRED=0
 fi
 
 STEP="find server leaf"
@@ -715,12 +771,16 @@ fi
 if [ "$DO_SERVER" = "1" ] && [ "$SERVER_CHANGED" = "1" ]; then
   STEP="server certificate (ICM CRED PSE)"
   if renew_icm_server "$TMP_P12"; then
-    [ "$DRYRUN" = "1" ] || state_write srv "$SRV_NOW"
+    # advance the state only when the instance was up (so a run while down is
+    # retried later, completing the reload and the view sync)
+    if [ "$INSTANCE_UP" = "1" ] && [ "$DRYRUN" != "1" ]; then state_write srv "$SRV_NOW"; fi
   else
     echo "WARN: server cert (ICM) not fully renewed"
   fi
   if [ "$SYNC_SERVER_VIEW" = "1" ]; then
-    if [ "$DRYRUN" != "1" ] && { ! have telnet || [ -z "$JAVA_TELNET_PW" ]; }; then
+    if [ "$DRYRUN" != "1" ] && [ "$INSTANCE_UP" = "0" ]; then
+      log "Instance down - NWA view sync deferred (needs a running instance)."
+    elif [ "$DRYRUN" != "1" ] && { ! have telnet || [ -z "$JAVA_TELNET_PW" ]; }; then
       log "SYNC_SERVER_VIEW=1 but telnet/password not configured - NWA view sync skipped."
       log "      (The server certificate is still deployed via the CRED PSE.)"
     else
@@ -745,6 +805,8 @@ fi
 if [ "$DO_CLIENT" = "1" ]; then
   if [ "$CLIENT_CHANGED" != "1" ]; then
     log "Client: unchanged since the last run - skipped."
+  elif [ "$DRYRUN" != "1" ] && [ "$INSTANCE_UP" = "0" ]; then
+    log "Client: instance down - Key Storage view LOAD deferred (needs a running instance)."
   elif [ -z "$CLIENT_VIEW" ] || [ -z "$CLIENT_ALIAS" ]; then
     echo "WARN: DO_CLIENT=1 but CLIENT_VIEW/CLIENT_ALIAS not configured - client skipped."
   elif [ ! -f "$CLIENT_P12" ]; then
@@ -780,9 +842,13 @@ fi
 
 # --- target 3: service_ssl (legacy; only if actually used) ------------------
 if [ "$DO_SERVICE_SSL" = "1" ] && [ "$SERVER_CHANGED" = "1" ]; then
-  STEP="service_ssl (view '$SERVICE_SSL_VIEW')"
-  load_view "$SERVICE_SSL_VIEW" "$SERVICE_SSL_ALIAS" "$TMP_P12" "$P12PW" \
-    || echo "WARN: view '$SERVICE_SSL_VIEW' not renewed"
+  if [ "$DRYRUN" != "1" ] && [ "$INSTANCE_UP" = "0" ]; then
+    log "service_ssl: instance down - view LOAD deferred (needs a running instance)."
+  else
+    STEP="service_ssl (view '$SERVICE_SSL_VIEW')"
+    load_view "$SERVICE_SSL_VIEW" "$SERVICE_SSL_ALIAS" "$TMP_P12" "$P12PW" \
+      || echo "WARN: view '$SERVICE_SSL_VIEW' not renewed"
+  fi
 fi
 
 # (the idempotency state is advanced per target via state_write above)

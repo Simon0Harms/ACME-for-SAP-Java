@@ -95,6 +95,12 @@ acme.sh --issue -d sapjava.example.com \
 
 Or from cron / by hand. When nothing has changed the script exits quietly.
 
+**If the instance is down** at renewal time, the script detects it, still stages
+the certificate into the CRED PSE (so it is served automatically on the next
+start), and defers the ICM reload and all Key Storage view operations to the
+next run while the instance is up (nothing is marked done, so it retries).
+Force this path with `INSTANCE_UP=0` if needed.
+
 ## The two mechanisms
 
 | Target | Mechanism | Notes |

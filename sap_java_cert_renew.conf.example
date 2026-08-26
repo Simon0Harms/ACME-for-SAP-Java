@@ -43,6 +43,8 @@ SYNC_SERVER_VIEW="1"      # also push the server cert into the NWA view (default
 # DRYRUN="1"              # preview without changing anything
 # ALLOW_ALGO_CHANGE="1"   # allow an RSA<->ECC switch on the live endpoint
 # RESTART_ICM_FALLBACK="1"  # restart the instance instead of SIGHUP for the reload
+# INSTANCE_UP="0"         # force the down path (auto-detected otherwise): stage the
+                          # PSE only, defer ICM reload and view sync to the next run
 
 # --- Key Storage view / entry names (site specific) --------------------------
 # SERVER_VIEW is auto-detected when left empty: ICM_SSL_<instance_id>_<port>,
