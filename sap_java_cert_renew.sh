@@ -202,10 +202,6 @@ P12PW=changeit                             # transient, local only (openssl/sapg
 # Executables and SECUDIR of the Java instance
 EXE="${EXE:-$USR_SAP/$SID/$INSTANCE_NAME/exe}"
 INST_SEC="${INST_SEC:-$USR_SAP/$SID/$INSTANCE_NAME/sec}"
-ICM_CRED_PSE="${ICM_CRED_PSE:-$INST_SEC/SAPSSLS.pse}"   # from icm/ssl_config_* CRED=
-
-# Staging directory for the telnet LOAD - MUST be located under /usr/sap/<SID>/
-STAGE_DIR="${STAGE_DIR:-$USR_SAP/$SID/SYS/global/security/data}"
 
 # External tools (on AIX possibly under /opt/freeware/bin/...)
 OPENSSL="${OPENSSL:-openssl}"
@@ -216,6 +212,34 @@ HTTPS_PORT="${HTTPS_PORT:-$(printf '5%s01' "$INST")}"
 TELNET_HOST="${TELNET_HOST:-127.0.0.1}"
 TELNET_PORT="${TELNET_PORT:-$(printf '5%s08' "$INST")}"
 
+# CRED PSE the ICM serves on the HTTPS port: read it from the instance profile
+# (the icm/ssl_config_<n> referenced by the HTTPS icm/server_port). This is the
+# authoritative source; its file name (SAPSSLS.pse vs SAPSSLS_<port>.pse) also
+# determines which Key Storage view to sync (see resolve_server_view).
+_cred_pse_from_profile() {
+  _cp_dir="$USR_SAP/${SID}/SYS/profile"
+  _cp_pre="${SID}_${INSTANCE_NAME}_"
+  for _p in "$_cp_dir/$_cp_pre"*; do
+    [ -f "$_p" ] || continue
+    case "$_p" in *.[0-9]|*.[0-9][0-9]) continue ;; esac   # skip rotated copies
+    _cp_cfg=$(awk -v port="$HTTPS_PORT" '
+      /^[ \t]*icm\/server_port_/ && /PROT=HTTPS/ && $0 ~ ("PORT=" port) {
+        if (match($0,/SSLCONFIG=[A-Za-z0-9_]+/)) { print substr($0,RSTART+10,RLENGTH-10); exit } }' "$_p")
+    [ -n "$_cp_cfg" ] || continue
+    awk -v cfg="icm/$_cp_cfg" '
+      $0 ~ ("^[ \t]*" cfg "[ \t]*=") {
+        if (match($0,/CRED=[^, \t]+/)) { print substr($0,RSTART+5,RLENGTH-5); exit } }' "$_p"
+    return 0
+  done
+}
+ICM_CRED_PSE="${ICM_CRED_PSE:-$(_cred_pse_from_profile 2>/dev/null)}"
+[ -n "$ICM_CRED_PSE" ] || ICM_CRED_PSE="$INST_SEC/SAPSSLS.pse"
+
+# Staging directory for the telnet BACKUP/LOAD. The console only allows files
+# under the Java INSTANCE installation directory (/usr/sap/<SID>/<INSTANCE>/),
+# not /usr/sap/<SID>/SYS/... - so stage inside the instance's sec directory.
+STAGE_DIR="${STAGE_DIR:-$USR_SAP/$SID/$INSTANCE_NAME/sec}"
+
 # Telnet admin access (UME admin). Password from a protected file (chmod 600).
 JAVA_TELNET_USER="${JAVA_TELNET_USER:-Administrator}"
 JAVA_TELNET_PW_FILE="${JAVA_TELNET_PW_FILE:-/root/sap_certs/${SID}_telnet.pw}"
@@ -224,13 +248,17 @@ KEYSTORE_GROUP="${KEYSTORE_GROUP:-keystore}"   # telnet command group name
 # Telnet timing (POSIX piping is timing sensitive; raise these if LOADs fail)
 TELNET_WAIT="${TELNET_WAIT:-2}"                # after connect / login
 TELNET_STEP_WAIT="${TELNET_STEP_WAIT:-2}"      # between commands
+TELNET_DEBUG="${TELNET_DEBUG:-0}"              # 1 = print the console transcript (p12 pw masked)
+TELNET_EOL="${TELNET_EOL:-\n}"                 # line terminator piped to the console. Default \n
+                                               # (the telnet client adds CR); if login still
+                                               # fails try \r\n or \r.
 
 # Key Storage view / entry names. The ICM_SSL views contain the instance id
 # (e.g. ICM_SSL_39631_50001). SERVER_VIEW is auto-detected when left empty (from
 # j2ee/instance_id + the HTTPS port, validated against LISTVIEWSNAMES). The
 # client view is site specific; set it if DO_CLIENT=1.
 SERVER_VIEW="${SERVER_VIEW:-}"                  # empty -> auto-detect ICM_SSL_<instid>_<port>
-SERVER_ALIAS="${SERVER_ALIAS:-ssl-credentials}" # standard entry name for ICM_SSL views
+SERVER_ALIAS="${SERVER_ALIAS:-}"                # empty -> auto: existing FQDN entry, else ssl-credentials
 CLIENT_VIEW="${CLIENT_VIEW:-}"                   # e.g. CLIENT_ICM_SSL_<instid>
 CLIENT_ALIAS="${CLIENT_ALIAS:-}"                # EXACT existing entry name (from NWA)
 SERVICE_SSL_VIEW="${SERVICE_SSL_VIEW:-service_ssl}"
@@ -241,6 +269,10 @@ SERVICE_SSL_ALIAS="${SERVICE_SSL_ALIAS:-ssl-credentials}"
 # LOAD. Empty = LOAD only (relies on overwrite). Verify the exact command/syntax
 # with bare 'man' in the telnet console before enabling.
 KEYSTORE_DELETE_CMD="${KEYSTORE_DELETE_CMD:-}"
+KEYSTORE_BACKUP="${KEYSTORE_BACKUP:-0}"     # 1 = attempt a keystore BACKUP before LOAD.
+                                            # Default 0: on AS Java 7.50 'BACKUP' expects an
+                                            # existing file (restore/upload), so creating one
+                                            # fails with "Backup not found". Failure is non-fatal.
 
 # Which targets to process? (1 = yes, 0 = no)
 DO_SERVER="${DO_SERVER:-1}"                 # ICM HTTPS server cert (CRED PSE)
@@ -510,34 +542,37 @@ Validate ECDSA support on this box first, then set ALLOW_ALGO_CHANGE=1."
 
 # ========================= telnet KEYSTORE harness ==========================
 # POSIX-only (no 'expect'). Login and commands are piped into the telnet client
-# stdin with sleeps. If LOADs fail intermittently, raise TELNET_WAIT. Passwords
-# go through stdin, not argv -> not visible in 'ps'.
-java_telnet() {  # $1=file with commands (one per line), $2=transcript output
-  _jt_cmds="$1"; _jt_out="$2"
+# stdin with sleeps. If commands are executed unreliably, raise TELNET_WAIT.
+# File-free: commands come in as a newline-separated string, the transcript is
+# printed to stdout (captured by the caller) - no temp files, and the password
+# goes through stdin, never argv or disk.
+java_telnet() {  # $1 = commands (newline-separated); prints transcript to stdout
   if ! have telnet; then echo "java_telnet: 'telnet' not found" >&2; return 1; fi
   if [ -z "$JAVA_TELNET_PW" ]; then
     echo "java_telnet: telnet password is empty ($JAVA_TELNET_PW_FILE, chmod 600)" >&2; return 1
   fi
-  (
+  {
     sleep "$TELNET_WAIT"
-    printf '%s\r\n' "$JAVA_TELNET_USER"; sleep "$TELNET_WAIT"
-    printf '%s\r\n' "$JAVA_TELNET_PW";   sleep "$TELNET_WAIT"
-    printf 'add %s\r\n' "$KEYSTORE_GROUP"; sleep "$TELNET_STEP_WAIT"
-    while IFS= read -r _jt_line; do
-      printf '%s\r\n' "$_jt_line"; sleep "$TELNET_STEP_WAIT"
-    done < "$_jt_cmds"
-    printf 'exit\r\n'; sleep "$TELNET_WAIT"
-  ) | telnet "$TELNET_HOST" "$TELNET_PORT" > "$_jt_out" 2>&1 || true
-  chmod 600 "$_jt_out" 2>/dev/null || true
+    printf '%s%b' "$JAVA_TELNET_USER" "$TELNET_EOL"; sleep "$TELNET_WAIT"
+    printf '%s%b' "$JAVA_TELNET_PW"   "$TELNET_EOL"; sleep "$TELNET_WAIT"
+    printf 'add %s%b' "$KEYSTORE_GROUP" "$TELNET_EOL"; sleep "$TELNET_STEP_WAIT"
+    printf '%s\n' "$1" | while IFS= read -r _jt_line; do
+      printf '%s%b' "$_jt_line" "$TELNET_EOL"; sleep "$TELNET_STEP_WAIT"
+    done
+    printf 'exit%b' "$TELNET_EOL"; sleep "$TELNET_WAIT"
+  } | telnet "$TELNET_HOST" "$TELNET_PORT" 2>&1
   return 0
 }
 
-# ---- stage a p12 under /usr/sap/<SID>/ (LOAD restriction) ------------------
+# ---- stage a p12 under the instance dir (LOAD restriction) -----------------
 stage_p12() {  # $1=source.p12 $2=target-name -> full path on stdout
   mkdir -p "$STAGE_DIR" 2>/dev/null || { echo "" ; return 1; }
   _sp_dst="$STAGE_DIR/$2"
   cp -p "$1" "$_sp_dst" 2>/dev/null || { echo ""; return 1; }
-  chmod 600 "$_sp_dst" 2>/dev/null || true
+  # the console reads the file as the Java process user (<sid>adm); make it
+  # readable via the sapsys group (best effort chown; group-read is enough)
+  chown "$SIDADM":sapsys "$_sp_dst" 2>/dev/null || true
+  chmod 640 "$_sp_dst" 2>/dev/null || true
   printf '%s' "$_sp_dst"
 }
 
@@ -554,57 +589,66 @@ _instid_from_profile() {  # -> digits of j2ee/instance_id (e.g. 39631)
 }
 
 # ---- list Key Storage view names via the telnet console (LISTVIEWSNAMES) ----
-keystore_views() {  # -> one view name per line (best effort)
+keystore_views() {  # -> one view name per line (best effort; never fatal)
   [ "$DRYRUN" = "1" ] && return 0
   have telnet || return 0
   [ -n "$JAVA_TELNET_PW" ] || return 0
-  _kv_cmd="$PRIV_TMP/tn_listviews.cmd"; _kv_out="$PRIV_TMP/tn_listviews.out"
-  printf 'LISTVIEWSNAMES\n' > "$_kv_cmd"
-  java_telnet "$_kv_cmd" "$_kv_out" || { secure_rm "$_kv_cmd" "$_kv_out"; return 0; }
+  _kv_out=$(java_telnet "LISTVIEWSNAMES") || return 0
   # keep only bare token lines (view names are [A-Za-z0-9_]); drops banner/prompts
-  sed 's/^[[:space:]]*//;s/[[:space:]]*$//' "$_kv_out" 2>/dev/null | grep -E '^[A-Za-z0-9_]+$'
-  secure_rm "$_kv_cmd" "$_kv_out"
+  printf '%s\n' "$_kv_out" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -E '^[A-Za-z0-9_]+$'
 }
 
-# ---- resolve the server view: ICM_SSL_<instid>_<port>, else ICM_SSL_<instid> -
-resolve_server_view() {  # -> view name (best effort) or empty
+# ---- resolve the server view from the CRED PSE the ICM actually serves ------
+# The relevant view is the one whose pse_location is the ICM's CRED PSE. That
+# mapping follows the PSE file name:
+#   SAPSSLS.pse         -> ICM_SSL_<instid>
+#   SAPSSLS_<port>.pse  -> ICM_SSL_<instid>_<port>
+# We derive that name, then validate against LISTVIEWSNAMES (with fallbacks).
+resolve_server_view() {  # -> view name (best effort) or empty; never fatal
   _rsv_id=$(_instid_from_profile 2>/dev/null)
   [ -n "$_rsv_id" ] || return 0
-  _rsv_primary="ICM_SSL_${_rsv_id}_${HTTPS_PORT}"
-  _rsv_fallback="ICM_SSL_${_rsv_id}"
-  # no live validation possible -> return the best-guess primary
+  _rsv_cred=$(basename "${ICM_CRED_PSE:-}" 2>/dev/null)
+  case "$_rsv_cred" in
+    SAPSSLS_*.pse) _sfx=${_rsv_cred#SAPSSLS_}; _sfx=${_sfx%.pse}; _rsv_primary="ICM_SSL_${_rsv_id}_${_sfx}" ;;
+    *)             _rsv_primary="ICM_SSL_${_rsv_id}" ;;
+  esac
+  _rsv_alt="ICM_SSL_${_rsv_id}_${HTTPS_PORT}"   # port-based guess
+  _rsv_base="ICM_SSL_${_rsv_id}"                # base view
+  # no live validation possible -> return the best-guess (CRED-derived) name
   if [ "$DRYRUN" = "1" ] || ! have telnet || [ -z "$JAVA_TELNET_PW" ]; then
     printf '%s' "$_rsv_primary"; return 0
   fi
-  _rsv_views=$(keystore_views)
-  if printf '%s\n' "$_rsv_views" | grep -Fxq "$_rsv_primary"; then
-    printf '%s' "$_rsv_primary"
-  elif printf '%s\n' "$_rsv_views" | grep -Fxq "$_rsv_fallback"; then
-    printf '%s' "$_rsv_fallback"
-  else
-    printf '%s' "$_rsv_primary"
-  fi
+  _rsv_views=$(keystore_views 2>/dev/null) || _rsv_views=""
+  for _c in "$_rsv_primary" "$_rsv_alt" "$_rsv_base"; do
+    if printf '%s\n' "$_rsv_views" | grep -Fxq "$_c"; then printf '%s' "$_c"; return 0; fi
+  done
+  printf '%s' "$_rsv_primary"
 }
 
 # ---- renew one Key Storage view via telnet ---------------------------------
-# BACKUP the whole keystore -> LOAD -> LIST (verification).
-load_view() {  # $1=view $2=alias $3=source.p12 $4=password(optional) -> rc
-  _lv_view="$1"; _lv_alias="$2"; _lv_src="$3"; _lv_pw="${4:-$P12PW}"
-  if [ -z "$_lv_view" ] || [ -z "$_lv_alias" ]; then
+# $2 is a preference-ordered, space-separated list of candidate entry aliases.
+# The target is the first candidate that already exists in the view (so an
+# existing FQDN-named key is reused rather than a second entry created); if none
+# exist, the first candidate is used. All existing candidates are deleted before
+# LOAD (needs KEYSTORE_DELETE_CMD) so exactly one entry remains - no duplicates.
+load_view() {  # $1=view $2=alias-candidates(pref order) $3=source.p12 $4=password(opt) -> rc
+  _lv_view="$1"; _lv_cands="$2"; _lv_src="$3"; _lv_pw="${4:-$P12PW}"
+  if [ -z "$_lv_view" ] || [ -z "$_lv_cands" ]; then
     echo "load_view: view or alias not configured - skipped"; return 1
   fi
   _lv_ts=$(date +%Y%m%d%H%M%S)
   _lv_bak="$STAGE_DIR/keystore_backup_${_lv_ts}.bak"
   _lv_stage_name="acme_java_${_lv_view}_${_lv_ts}.p12"
 
-  # DRYRUN: preview WITH a masked password (no cleartext PW in log / acme output)
+  # DRYRUN: preview (can't LIST) -> assume the first candidate is the target
   if [ "$DRYRUN" = "1" ]; then
-    log "View '$_lv_view': (DRYRUN) BACKUP -> LOAD (alias '$_lv_alias') -> LIST"
+    for _c in $_lv_cands; do _lv_alias="$_c"; break; done
+    log "View '$_lv_view': (DRYRUN) LOAD (alias '$_lv_alias', from candidates: $_lv_cands) -> LIST"
     printf '  [DRYRUN] telnet %s %s -- login as %s, add %s, then:\n' \
       "$TELNET_HOST" "$TELNET_PORT" "$JAVA_TELNET_USER" "$KEYSTORE_GROUP"
-    printf '    | BACKUP %s\n' "$_lv_bak"
-    [ -n "$KEYSTORE_DELETE_CMD" ] && printf '    | %s %s %s\n' "$KEYSTORE_DELETE_CMD" "$_lv_view" "$_lv_alias"
-    printf '    | LOAD %s %s -PKCS12 %s ********\n' "$_lv_view" "$_lv_alias" "$STAGE_DIR/$_lv_stage_name"
+    [ "$KEYSTORE_BACKUP" = "1" ] && printf '    | BACKUP %s   (best effort)\n' "$_lv_bak"
+    [ -n "$KEYSTORE_DELETE_CMD" ] && printf '    | %s %s <stray candidate>   (only differently-named extras, if any)\n' "$KEYSTORE_DELETE_CMD" "$_lv_view"
+    printf '    | LOAD %s %s -PKCS12 %s ********   (overwrites the entry of that name)\n' "$_lv_view" "$_lv_alias" "$STAGE_DIR/$_lv_stage_name"
     printf '    | LIST %s\n' "$_lv_view"
     return 0
   fi
@@ -612,32 +656,84 @@ load_view() {  # $1=view $2=alias $3=source.p12 $4=password(optional) -> rc
   _lv_stage=$(stage_p12 "$_lv_src" "$_lv_stage_name") || _lv_stage=""
   [ -n "$_lv_stage" ] || { echo "load_view: staging failed ($STAGE_DIR)"; return 1; }
 
-  _lv_cmdf="$PRIV_TMP/tn_${_lv_view}.cmd"
-  _lv_outf="$PRIV_TMP/tn_${_lv_view}.out"
-  {
-    printf 'BACKUP %s\n' "$_lv_bak"
-    [ -n "$KEYSTORE_DELETE_CMD" ] && printf '%s %s %s\n' "$KEYSTORE_DELETE_CMD" "$_lv_view" "$_lv_alias"
+  # optional keystore backup, in its own session so its outcome does not mask the
+  # LOAD verification (the backup is a safety net; the served cert is the PSE)
+  if [ "$KEYSTORE_BACKUP" = "1" ]; then
+    _lv_bkout=$(java_telnet "BACKUP $_lv_bak")
+    [ "$TELNET_DEBUG" = "1" ] && printf '%s\n' "$_lv_bkout" | sed 's/^/    bk> /'
+    if printf '%s\n' "$_lv_bkout" | grep -qi -e error -e 'not found' -e prohibited -e 'usage:' -e failed; then
+      echo "WARN: keystore BACKUP failed (non-fatal) - continuing with LOAD. Set KEYSTORE_BACKUP=0 to skip it."
+    fi
+  fi
+
+  # one pre-LIST: which candidates already exist -> pick target + deletes
+  _lv_present=""
+  if have telnet && [ -n "$JAVA_TELNET_PW" ]; then
+    _lv_listing=$(java_telnet "LIST $_lv_view" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    for _c in $_lv_cands; do
+      printf '%s\n' "$_lv_listing" | grep -Fxq "$_c" && _lv_present="$_lv_present $_c"
+    done
+  fi
+  # target = first existing candidate, else the first candidate
+  _lv_alias=""
+  for _c in $_lv_present; do _lv_alias="$_c"; break; done
+  if [ -z "$_lv_alias" ]; then for _c in $_lv_cands; do _lv_alias="$_c"; break; done; fi
+
+  # LOAD overwrites an entry of the SAME alias, so the target itself needs no
+  # delete. Only *other* existing candidates (differently-named stray keys from a
+  # previous run or manual import) would remain as extra entries - remove those
+  # if a delete command is available; otherwise just warn.
+  _lv_dels=""
+  for _c in $_lv_present; do
+    [ "$_c" = "$_lv_alias" ] && continue
+    if [ -n "$KEYSTORE_DELETE_CMD" ]; then
+      _lv_dels="$_lv_dels $_c"
+      log "View '$_lv_view': removing stray entry '$_c'"
+    else
+      echo "WARN: stray key entry '$_c' remains in '$_lv_view' (LOAD updates '$_lv_alias' only)."
+      echo "      Set KEYSTORE_DELETE_CMD=DELETE to remove such extra entries automatically."
+    fi
+  done
+
+  # deletes (if any) then LOAD then LIST - verified on its own output
+  _lv_cmds=$(
+    for _a in $_lv_dels; do printf '%s %s %s\n' "$KEYSTORE_DELETE_CMD" "$_lv_view" "$_a"; done
     printf 'LOAD %s %s -PKCS12 %s %s\n' "$_lv_view" "$_lv_alias" "$_lv_stage" "$_lv_pw"
     printf 'LIST %s\n' "$_lv_view"
-  } > "$_lv_cmdf"
-  chmod 600 "$_lv_cmdf" 2>/dev/null || true
+  )
 
-  log "View '$_lv_view': BACKUP -> LOAD (alias '$_lv_alias') -> LIST"
-  java_telnet "$_lv_cmdf" "$_lv_outf" || { secure_rm "$_lv_cmdf" "$_lv_stage"; return 1; }
+  log "View '$_lv_view': LOAD (alias '$_lv_alias') -> LIST"
+  _lv_out=$(java_telnet "$_lv_cmds") || { secure_rm "$_lv_stage"; return 1; }
+
+  # optional: show the raw console transcript for diagnosis (passwords masked)
+  if [ "$TELNET_DEBUG" = "1" ]; then
+    printf '%s\n' "$_lv_out" \
+      | awk -v pw="$JAVA_TELNET_PW" '{l=$0;sub(/\r$/,"",l); if(pw!=""&&l==pw){print "********";next} if($0~/-PKCS12/){$NF="********"} print}' \
+      | sed 's/^/    tn> /'
+  fi
 
   _lv_rc=0
-  # verification: alias present in LIST output, no obvious errors
-  if grep -qi -e 'error' -e 'exception' -e 'not found' -e 'no such' "$_lv_outf" 2>/dev/null; then
-    echo "WARN: telnet output contains error hints for view '$_lv_view' - please check:"
-    grep -i -e error -e exception -e 'not found' -e 'no such' "$_lv_outf" | sed 's/^/    > /' | head -n 5
+  # telnet login failure -> precise, actionable message (not the generic one below)
+  if printf '%s\n' "$_lv_out" | grep -qi -e 'login failed' -e 'authentication failed' -e 'cannot authenticate'; then
+    echo "WARN: telnet login failed for user '$JAVA_TELNET_USER' on $TELNET_HOST:$TELNET_PORT."
+    echo "      Check JAVA_TELNET_USER and the password in $JAVA_TELNET_PW_FILE"
+    echo "      (test it manually: telnet $TELNET_HOST $TELNET_PORT). The server certificate"
+    echo "      is deployed via the CRED PSE regardless; only the NWA view sync is affected."
+    secure_rm "$_lv_stage"; return 1
+  fi
+  # verification: no LOAD error, and the target alias present in the LIST output
+  if printf '%s\n' "$_lv_out" | grep -qi -e 'error' -e 'exception' -e 'not found' -e 'no such' -e 'prohibited' -e 'usage:' -e 'failed'; then
+    echo "WARN: LOAD reported an error for view '$_lv_view' (run with TELNET_DEBUG=1 to see it):"
+    printf '%s\n' "$_lv_out" | grep -i -e error -e exception -e 'not found' -e 'no such' -e prohibited -e 'usage:' -e failed \
+      | awk -v pw="$JAVA_TELNET_PW" '{l=$0;sub(/\r$/,"",l); if(pw!=""&&l==pw){print "********";next} if($0~/-PKCS12/){$NF="********"} print}' \
+      | sed 's/^/    > /' | head -n 5
     _lv_rc=1
   fi
-  if ! grep -q "$_lv_alias" "$_lv_outf" 2>/dev/null; then
-    echo "WARN: alias '$_lv_alias' not found in LIST of '$_lv_view' after LOAD."
+  if ! printf '%s\n' "$_lv_out" | grep -q "$_lv_alias"; then
+    echo "WARN: alias '$_lv_alias' not found in LIST of '$_lv_view' after LOAD (run with TELNET_DEBUG=1 to inspect)."
     _lv_rc=1
   fi
-  # the command file holds the cleartext password -> wipe it
-  secure_rm "$_lv_cmdf" "$_lv_stage"
+  secure_rm "$_lv_stage"
   return $_lv_rc
 }
 
@@ -703,9 +799,10 @@ log "=== AS Java certificate renewal: SID=$SID instance=$INSTANCE_NAME host=$HOS
 [ "$DRYRUN" = "1" ] && log ">>> DRYRUN active - nothing is changed. Real run: DRYRUN=0 <<<"
 
 # load the telnet password (only needed for an actual view LOAD; java_telnet
-# reports an empty password itself)
+# reports an empty password itself). Strip CR so a CRLF/Windows-edited .pw file
+# does not send a stray carriage return and fail authentication.
 if [ -f "$JAVA_TELNET_PW_FILE" ]; then
-  JAVA_TELNET_PW=$(cat "$JAVA_TELNET_PW_FILE" 2>/dev/null) || JAVA_TELNET_PW=""
+  JAVA_TELNET_PW=$(tr -d '\r' < "$JAVA_TELNET_PW_FILE" 2>/dev/null) || JAVA_TELNET_PW=""
 fi
 
 # Determine whether the instance is running. When it is down we still stage the
@@ -798,32 +895,49 @@ fi
 # --- target 1: server (ICM CRED PSE) ----------------------------------------
 if [ "$DO_SERVER" = "1" ] && [ "$SERVER_CHANGED" = "1" ]; then
   STEP="server certificate (ICM CRED PSE)"
-  if renew_icm_server "$TMP_P12"; then
-    # advance the state only when the instance was up (so a run while down is
-    # retried later, completing the reload and the view sync)
-    if [ "$INSTANCE_UP" = "1" ] && [ "$DRYRUN" != "1" ]; then state_write srv "$SRV_NOW"; fi
-  else
-    echo "WARN: server cert (ICM) not fully renewed"
-  fi
+  _srv_ok=0; _sync_ok=1
+  if renew_icm_server "$TMP_P12"; then _srv_ok=1; else echo "WARN: server cert (ICM) not fully renewed"; fi
   if [ "$SYNC_SERVER_VIEW" = "1" ]; then
     if [ "$DRYRUN" != "1" ] && [ "$INSTANCE_UP" = "0" ]; then
       log "Instance down - NWA view sync deferred (needs a running instance)."
+      _sync_ok=0
     elif [ "$DRYRUN" != "1" ] && { ! have telnet || [ -z "$JAVA_TELNET_PW" ]; }; then
       log "SYNC_SERVER_VIEW=1 but telnet/password not configured - NWA view sync skipped."
       log "      (The server certificate is still deployed via the CRED PSE.)"
+      # intentional server-only setup: do not force a retry
     else
       STEP="sync server view (telnet LOAD)"
       if [ -z "$SERVER_VIEW" ]; then
-        SERVER_VIEW=$(resolve_server_view)
+        SERVER_VIEW=$(resolve_server_view 2>/dev/null) || SERVER_VIEW=""
         [ -n "$SERVER_VIEW" ] && log "Auto-detected server view: $SERVER_VIEW"
       fi
       if [ -z "$SERVER_VIEW" ]; then
         log "SYNC_SERVER_VIEW=1 but the server view could not be resolved - set SERVER_VIEW; sync skipped."
+        _sync_ok=0
       else
-        load_view "$SERVER_VIEW" "$SERVER_ALIAS" "$TMP_P12" "$P12PW" \
-          || echo "WARN: server view '$SERVER_VIEW' not synced"
+        # candidate entry aliases, preference order: the certificate's own FQDN
+        # (most reliable), then HOST_FQDN, then the short host name, then the SAP
+        # standard 'ssl-credentials'. Deduplicated. This reuses whatever existing
+        # host-named key entry the view already has instead of adding a new one.
+        _srv_dom=$(basename "$LEAF" .cer 2>/dev/null)
+        _srv_cands=""
+        for _c in "$_srv_dom" "$HOST_FQDN" "${_srv_dom%%.*}" "${HOST_FQDN%%.*}" ssl-credentials; do
+          [ -n "$_c" ] || continue
+          case " $_srv_cands " in *" $_c "*) ;; *) _srv_cands="$_srv_cands $_c" ;; esac
+        done
+        if load_view "$SERVER_VIEW" "${SERVER_ALIAS:-$_srv_cands}" "$TMP_P12" "$P12PW"; then
+          :
+        else
+          echo "WARN: server view '$SERVER_VIEW' not synced"
+          _sync_ok=0
+        fi
       fi
     fi
+  fi
+  # advance the state only when the cert deployed, the instance was up, and a
+  # requested view sync did not fail - so a failed/deferred sync retries next run
+  if [ "$_srv_ok" = "1" ] && [ "$_sync_ok" = "1" ] && [ "$INSTANCE_UP" = "1" ] && [ "$DRYRUN" != "1" ]; then
+    state_write srv "$SRV_NOW"
   fi
 elif [ "$DO_SERVER" = "1" ]; then
   log "Server: unchanged since the last run - skipped."
@@ -881,8 +995,11 @@ fi
 
 # (the idempotency state is advanced per target via state_write above)
 
-# --- prune old ICM PSE backups (keep the last 5) ----------------------------
+# --- prune old ICM PSE + keystore backups (keep the last 5 of each) ---------
 ( ls -t "$INST_SEC"/SAPSSLS.pse.*.bak 2>/dev/null | tail -n +6 | while IFS= read -r _bak; do
+    [ -n "$_bak" ] && run rm -f "$_bak"
+  done ) 2>/dev/null || true
+( ls -t "$STAGE_DIR"/keystore_backup_*.bak 2>/dev/null | tail -n +6 | while IFS= read -r _bak; do
     [ -n "$_bak" ] && run rm -f "$_bak"
   done ) 2>/dev/null || true
 

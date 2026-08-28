@@ -48,27 +48,38 @@ SYNC_SERVER_VIEW="1"      # also push the server cert into the NWA view (default
 # INSTANCE_UP="0"         # force the down path (auto-detected otherwise): stage the
                           # PSE only, defer ICM reload and view sync to the next run
 
-# --- Key Storage view / entry names (site specific) --------------------------
-# SERVER_VIEW is auto-detected when left empty: ICM_SSL_<instance_id>_<port>,
-# validated against LISTVIEWSNAMES (falls back to ICM_SSL_<instance_id>). Set it
-# explicitly only to override. Discover names with LISTVIEWSNAMES / in NWA.
-# SERVER_VIEW="ICM_SSL_39631_50001"
-# SERVER_ALIAS="ssl-credentials"
-# CLIENT_VIEW="CLIENT_ICM_SSL_39631"   # needed if DO_CLIENT=1
-# CLIENT_ALIAS="myhost-client"         # EXACT existing entry name (an alias, not the CN)
+# --- Key Storage view / entry names (usually auto-detected) -------------------
+# SERVER_VIEW and the ICM CRED PSE are auto-detected from the instance profile:
+# the HTTPS icm/server_port -> its SSLCONFIG -> CRED=<pse>, and the PSE file name
+# maps to the view (SAPSSLS.pse -> ICM_SSL_<instid>, SAPSSLS_<port>.pse ->
+# ICM_SSL_<instid>_<port>), validated via LISTVIEWSNAMES. The server entry alias
+# is auto-detected too: an existing entry named after the FQDN is reused, else
+# 'ssl-credentials'; all existing candidates are replaced (no duplicates).
+# Override any of these only if needed:
+# SERVER_VIEW="ICM_SSL_1238608"
+# SERVER_ALIAS="sol72.bs.ptb.de"   # force a specific entry name
+# ICM_CRED_PSE="/usr/sap/SMJ/J12/sec/SAPSSLS.pse"
+# CLIENT_VIEW="CLIENT_ICM_SSL_1238608"   # needed if DO_CLIENT=1
+# CLIENT_ALIAS="myhost-client"           # EXACT existing entry name (an alias, not the CN)
 # SERVICE_SSL_VIEW="service_ssl"
 # SERVICE_SSL_ALIAS="ssl-credentials"
 
-# If LOAD does not overwrite an existing alias on your console, set the delete
-# command (run as "<cmd> <view> <alias>" before LOAD). Verify with bare 'man'.
+# LOAD overwrites an entry of the same alias, so a normal renewal needs NO delete.
+# Set KEYSTORE_DELETE_CMD only to auto-remove differently-named stray key entries
+# (e.g. a short host name or 'ssl-credentials' left over from an earlier import).
 # KEYSTORE_DELETE_CMD="DELETE"
+# KEYSTORE_BACKUP="1"      # attempt a pre-LOAD keystore BACKUP (default 0; on AS Java 7.50
+                          # 'BACKUP' is a restore/upload command, so creating one fails)
 
 # --- telnet administration console ------------------------------------------
 JAVA_TELNET_USER="Administrator"
 JAVA_TELNET_PW_FILE="/root/sap_certs/${SID}_telnet.pw"   # chmod 600
 # KEYSTORE_GROUP="keystore"          # verify with bare 'man' in the console
-# TELNET_WAIT="2"                    # raise if LOADs fail intermittently
+# TELNET_WAIT="2"                    # raise if the console executes commands unreliably
 # TELNET_STEP_WAIT="2"
+# TELNET_DEBUG="1"                   # print the console transcript for diagnosis (pw masked)
+# TELNET_EOL='\r\n'                  # line terminator; default \n. Use \r\n or \r only if
+                                     # login fails because of terminator handling
 
 # --- external client p12 (only used when DO_CLIENT=1) ------------------------
 # A clientAuth certificate from your internal CA (NOT the acme/HARICA server
